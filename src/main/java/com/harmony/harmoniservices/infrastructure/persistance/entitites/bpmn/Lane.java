@@ -24,6 +24,8 @@ public class Lane {
     @JoinColumn(name = "lane_set_id", referencedColumnName = "id")
     private LaneSet laneSet;
 
-   
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "process_id")
+    private BpmnProcess process;
     
 }

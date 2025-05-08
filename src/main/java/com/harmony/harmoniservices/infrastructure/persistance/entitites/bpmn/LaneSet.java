@@ -23,5 +23,9 @@ public class LaneSet {
     @ManyToOne
     @JoinColumn(name = "pool_id", referencedColumnName = "id")
     private Pool pool;
+
     
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "process_id")
+    private BpmnProcess process;
 }

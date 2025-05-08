@@ -1,0 +1,84 @@
+services:
+  postgres:
+    container_name: bd_pg_harmony
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: gallagher
+      POSTGRES_PASSWORD: gallagher09
+      POSTGRES_DB: harmony_db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data 
+    ports:
+      - "5432:5432"
+    networks:
+      - microservices-net
+    restart: unless-stopped
+    healthcheck: 
+      test: ["CMD-SHELL", "pg_isready -U gallagher -d harmony_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  pgadmin:
+    container_name: bd_pgadmin_harmony
+    image: dpage/pgadmin4
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_DEFAULT_EMAIL:-pgadmin@pgadmin.org}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_DEFAULT_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    volumes:
+      - pgadmin-data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    networks:
+      - microservices-net
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy # pgAdmin attend que postgres soit sain
+
+  db_service_user:
+    container_name: mysql-service_user
+    image: mysql:5.7.22
+    volumes:
+      - mysql_db:/var/lib/mysql/
+    restart: always
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: kairos_users_service
+      MYSQL_USER: gallagher
+      MYSQL_PASSWORD: gallagher09
+      MYSQL_ROOT_HOST: '%'
+    command: --default-authentication-plugin=mysql_native_password --bind-address=0.0.0.0
+    networks:
+      - microservices-net
+
+  rabbimq:
+    container_name: rabbitmq
+    image: rabbitmq:3-management
+    ports:
+      - "15672:15672" 
+      - "5672:5672"   
+    networks:
+      - microservices-net
+    restart: unless-stopped
+    environment:
+      SPRING_RABBITMQ_HOST: localhost
+      RABBITMQ_DEFAULT_USER: gallagher
+      RABBITMQ_DEFAULT_PASS: gallagher09
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running"]
+      interval: 10s
+      timeout: 5s
+      retries: 3  
+
+volumes:
+  postgres-data:
+  pgadmin-data:
+  mysql_db:
+
+
+networks:
+  microservices-net:
