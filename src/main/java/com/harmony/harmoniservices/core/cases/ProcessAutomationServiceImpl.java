@@ -8,15 +8,26 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import com.harmony.harmoniservices.core.domain.entities.BpmnProcess;
+import com.harmony.harmoniservices.core.domain.entities.Event;
+import com.harmony.harmoniservices.core.domain.entities.Gateway;
 import com.harmony.harmoniservices.core.domain.entities.ProcessExecution;
 import com.harmony.harmoniservices.core.domain.entities.ProcessInstance;
+import com.harmony.harmoniservices.core.domain.entities.SequenceFlow;
 import com.harmony.harmoniservices.core.domain.entities.Task;
 import com.harmony.harmoniservices.core.domain.entities.TaskConfiguration;
 import com.harmony.harmoniservices.core.domain.entities.User;
+import com.harmony.harmoniservices.core.domain.enums.TriggerType;
+import com.harmony.harmoniservices.core.domain.enums.TypeGateway;
+import com.harmony.harmoniservices.core.domain.events.MessageEvent;
+import com.harmony.harmoniservices.core.domain.events.SignalEvent;
+import com.harmony.harmoniservices.core.domain.events.TimerEvent;
+import com.harmony.harmoniservices.core.domain.services.EventHandler;
+import com.harmony.harmoniservices.core.domain.services.GatewayEvaluator;
 import com.harmony.harmoniservices.core.ports.cases.BpmnService;
 import com.harmony.harmoniservices.core.ports.cases.ProcessAutomationService;
 import com.harmony.harmoniservices.core.ports.repository.ProcessInstanceRepository;
@@ -37,6 +48,8 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
     private final ProcessExecutionRepository processExecutionRepository;
     private final TaskConfigurationRepository taskConfigurationRepository;
     private final BpmnProcessRepository bpmnProcessRepository;
+    private final GatewayEvaluator gatewayEvaluator;
+    private final EventHandler eventHandler;
 
     @Override
     @Transactional
@@ -60,13 +73,9 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
                 .updatedAt(LocalDateTime.now())
                 .build();
         
-        // Déterminer la première tâche
-        // Ici, on suppose que la première tâche est identifiée par une logique métier
-        // En pratique, vous utiliseriez un moteur de workflow comme Camunda ou Flowable pour déterminer cela
-        
-        // Exemple simplifié: prendre la première tâche trouvée
-        String firstTaskId = findFirstTaskId(process);
-        instance.setCurrentTaskId(firstTaskId);
+        // Déterminer la première tâche ou événement
+        String firstElementId = findStartElement(process);
+        instance.setCurrentTaskId(firstElementId);
         
         // Persister l'instance
         ProcessInstance savedInstance = processInstanceRepository.save(instance);
@@ -85,6 +94,9 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
                 .build();
         
         processExecutionRepository.save(execution);
+        
+        // Configurer les événements de démarrage (timer, message, signal)
+        setupInitialEvents(savedInstance);
         
         return savedInstance;
     }
@@ -130,16 +142,28 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
         
         processExecutionRepository.save(execution);
         
-        // Déterminer la prochaine tâche
-        String nextTaskId = determineNextTask(instance.getProcess(), taskId, instance.getProcessVariables());
+        // Déterminer la/les prochaine(s) tâche(s)
+        List<String> nextElementIds = determineNextElements(instance.getProcess(), taskId, instance.getProcessVariables());
         
         // Si pas de prochaine tâche, terminer le processus
-        if (nextTaskId == null) {
+        if (nextElementIds.isEmpty()) {
             instance.setStatus("COMPLETED");
             instance.setEndTime(now);
             instance.setCurrentTaskId(null);
-        } else {
-            instance.setCurrentTaskId(nextTaskId);
+        } 
+        // Si plusieurs tâches suivantes (après passerelle parallèle), gérer les chemins parallèles
+        else if (nextElementIds.size() > 1) {
+            // Dans une implémentation complète, nous gérerions ici les chemins parallèles avec un moteur
+            // comme Camunda. Pour cette implémentation simplifiée, nous prenons juste le premier élément.
+            instance.setCurrentTaskId(nextElementIds.get(0));
+            log.warn("Plusieurs chemins détectés après une passerelle. Seul le premier est suivi dans cette implémentation.");
+        }
+        // Cas normal: une seule tâche suivante
+        else {
+            instance.setCurrentTaskId(nextElementIds.get(0));
+            
+            // Vérifier si le prochain élément est un événement et le configurer si nécessaire
+            setupEventIfNeeded(instance, nextElementIds.get(0));
         }
         
         instance.setUpdatedAt(now);
@@ -283,12 +307,28 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
     
     // Méthodes utilitaires privées
     
-    private String findFirstTaskId(BpmnProcess process) {
-        // Ici, on devrait utiliser la logique du moteur de workflow pour déterminer la première tâche
-        // Pour l'exemple, on prend simplement la première tâche trouvée
+    private String findStartElement(BpmnProcess process) {
+        // Chercher d'abord un événement de démarrage
+        Optional<Event> startEvent = process.getEvents().stream()
+                .filter(event -> event.getTypeEvent().name().contains("START"))
+                .findFirst();
+        
+        if (startEvent.isPresent()) {
+            // Trouver la séquence sortant de l'événement de démarrage
+            Optional<SequenceFlow> startSequence = process.getSequenceFlows().stream()
+                    .filter(flow -> flow.getSourceRef().equals(startEvent.get().getId()))
+                    .findFirst();
+            
+            if (startSequence.isPresent()) {
+                return startSequence.get().getTargetRef();
+            }
+        }
+        
+        // Si pas d'événement de démarrage trouvé, prendre la première tâche
         if (process.getTasks() != null && !process.getTasks().isEmpty()) {
             return process.getTasks().get(0).getId();
         }
+        
         return null;
     }
     
@@ -332,26 +372,260 @@ public class ProcessAutomationServiceImpl implements ProcessAutomationService {
                 .orElse("Tâche inconnue");
     }
     
-    private String determineNextTask(BpmnProcess process, String currentTaskId, Map<String, Object> variables) {
-        // Ici, on devrait utiliser la logique du moteur de workflow pour déterminer la prochaine tâche
-        // Pour l'exemple, on prend simplement la tâche suivante dans la liste
-        List<Task> tasks = process.getTasks();
-        if (tasks == null || tasks.isEmpty()) {
-            return null;
+    private List<String> determineNextElements(BpmnProcess process, String currentElementId, Map<String, Object> variables) {
+        // Trouver les séquences sortant de l'élément courant
+        List<SequenceFlow> outgoingFlows = process.getSequenceFlows().stream()
+                .filter(flow -> flow.getSourceRef().equals(currentElementId))
+                .collect(Collectors.toList());
+        
+        // Si pas de flux sortant, fin du processus
+        if (outgoingFlows.isEmpty()) {
+            return new ArrayList<>();
         }
         
-        int currentIndex = -1;
-        for (int i = 0; i < tasks.size(); i++) {
-            if (tasks.get(i).getId().equals(currentTaskId)) {
-                currentIndex = i;
-                break;
+        // Si un seul flux sortant, le suivre directement
+        if (outgoingFlows.size() == 1) {
+            String targetRef = outgoingFlows.get(0).getTargetRef();
+            return List.of(targetRef);
+        }
+        
+        // S'il y a plusieurs flux sortants, c'est probablement une passerelle
+        // Chercher la passerelle connectée
+        for (SequenceFlow flow : outgoingFlows) {
+            Optional<Gateway> gateway = process.getGateways().stream()
+                    .filter(g -> g.getId().equals(flow.getTargetRef()))
+                    .findFirst();
+            
+            if (gateway.isPresent()) {
+                // Trouver les flux sortants de la passerelle
+                List<SequenceFlow> gatewayOutflows = process.getSequenceFlows().stream()
+                        .filter(f -> f.getSourceRef().equals(gateway.get().getId()))
+                        .collect(Collectors.toList());
+                
+                // Évaluer la passerelle selon son type
+                return evaluateGateway(gateway.get(), gatewayOutflows, variables).stream()
+                        .map(SequenceFlow::getTargetRef)
+                        .collect(Collectors.toList());
             }
         }
         
-        if (currentIndex >= 0 && currentIndex < tasks.size() - 1) {
-            return tasks.get(currentIndex + 1).getId();
-        }
+        // Si on ne trouve pas de passerelle, suivre le premier flux par défaut
+        return List.of(outgoingFlows.get(0).getTargetRef());
+    }
+    
+    private List<SequenceFlow> evaluateGateway(Gateway gateway, List<SequenceFlow> outgoingFlows, Map<String, Object> variables) {
+        TypeGateway type = gateway.getTypeGateway();
         
-        return null; // Pas de tâche suivante, fin du processus
+        switch (type) {
+            case EXCLUSIVE:
+                return List.of(gatewayEvaluator.evaluateExclusiveGateway(gateway, outgoingFlows, variables));
+            case INCLUSIVE:
+                return gatewayEvaluator.evaluateInclusiveGateway(gateway, outgoingFlows, variables);
+            case PARALLEL:
+                return gatewayEvaluator.evaluateParallelGateway(gateway, outgoingFlows);
+            case EVENT_BASED:
+                // Pour les passerelles basées sur les événements, configuration spéciale
+                setupEventBasedGateway(gateway, outgoingFlows);
+                // Retourner un flux vide car le processus sera repris quand un événement sera déclenché
+                return new ArrayList<>();
+            default:
+                log.warn("Type de passerelle non géré: {}. Traitement comme une passerelle exclusive.", type);
+                return List.of(gatewayEvaluator.evaluateExclusiveGateway(gateway, outgoingFlows, variables));
+        }
+    }
+    
+    private void setupInitialEvents(ProcessInstance instance) {
+        BpmnProcess process = instance.getProcess();
+        
+        // Chercher tous les événements qui peuvent déclencher le processus (timer, message, signal)
+        process.getEvents().stream()
+                .filter(event -> event.getTypeEvent().name().contains("START"))
+                .forEach(event -> {
+                    if (event.getTriggerType() == TriggerType.TIMER) {
+                        eventHandler.scheduleTimerEvent(instance, event, instance.getProcessVariables());
+                    } else if (event.getTriggerType() == TriggerType.MESSAGE) {
+                        // Pour les messages, on utiliserait le businessKey comme clé de corrélation
+                        eventHandler.subscribeToMessage(instance, event, instance.getBusinessKey());
+                    } else if (event.getTriggerType() == TriggerType.SIGNAL) {
+                        eventHandler.subscribeToSignal(instance, event);
+                    }
+                });
+    }
+    
+    private void setupEventIfNeeded(ProcessInstance instance, String elementId) {
+        BpmnProcess process = instance.getProcess();
+        
+        // Chercher si l'élément est un événement
+        Optional<Event> event = process.getEvents().stream()
+                .filter(e -> e.getId().equals(elementId))
+                .findFirst();
+        
+        if (event.isPresent()) {
+            Event e = event.get();
+            
+            if (e.getTriggerType() == TriggerType.TIMER) {
+                eventHandler.scheduleTimerEvent(instance, e, instance.getProcessVariables());
+            } else if (e.getTriggerType() == TriggerType.MESSAGE) {
+                // Pour les messages, utiliser le businessKey comme clé de corrélation
+                eventHandler.subscribeToMessage(instance, e, instance.getBusinessKey());
+            } else if (e.getTriggerType() == TriggerType.SIGNAL) {
+                eventHandler.subscribeToSignal(instance, e);
+            }
+        }
+    }
+    
+    private void setupEventBasedGateway(Gateway gateway, List<SequenceFlow> outgoingFlows) {
+        // Pour chaque flux sortant, trouver l'événement associé et le configurer
+        for (SequenceFlow flow : outgoingFlows) {
+            String targetRef = flow.getTargetRef();
+            
+            // Chercher l'instance de processus concernée
+            // Dans une implémentation réelle, cela serait géré par le moteur de workflow
+            log.info("Configuration de la passerelle basée sur les événements pour la cible {}", targetRef);
+            
+            // Ici, nous simulons simplement le comportement
+            // En production, cela serait fait par le moteur Camunda
+        }
+    }
+    
+    @EventListener
+    public void handleTimerEvent(TimerEvent event) {
+        log.info("Réception d'un événement timer pour l'instance {} et l'événement {}", 
+                event.getProcessInstanceId(), event.getEventId());
+        
+        // Récupérer l'instance de processus
+        Optional<ProcessInstance> optInstance = processInstanceRepository.findById(event.getProcessInstanceId());
+        
+        if (optInstance.isPresent()) {
+            ProcessInstance instance = optInstance.get();
+            
+            // Si le processus est actif et l'événement correspond à l'élément courant
+            if ("ACTIVE".equals(instance.getStatus()) && event.getEventId().equals(instance.getCurrentTaskId())) {
+                // Construire un utilisateur système pour l'exécution automatique
+                User systemUser = User.builder()
+                        .id(0L)
+                        .username("system")
+                        .build();
+                
+                // Compléter la tâche/événement
+                completeTask(instance.getId(), event.getEventId(), systemUser, event.getVariables());
+            }
+        }
+    }
+    
+    @EventListener
+    public void handleMessageEvent(MessageEvent event) {
+        log.info("Réception d'un message: {} avec la clé {}", 
+                event.getMessageName(), event.getCorrelationKey());
+        
+        // Chercher toutes les souscriptions correspondantes
+        // Dans une implémentation réelle, cela serait géré par le moteur de workflow
+        
+        // Ici, nous simulons simplement le comportement
+        // En production, cela serait fait par le moteur Camunda
+    }
+    
+    @EventListener
+    public void handleSignalEvent(SignalEvent event) {
+        log.info("Réception d'un signal: {}", event.getSignalName());
+        
+        // Chercher toutes les souscriptions correspondantes
+        // Dans une implémentation réelle, cela serait géré par le moteur de workflow
+        
+        // Ici, nous simulons simplement le comportement
+        // En production, cela serait fait par le moteur Camunda
+    }
+
+    @Override
+    @Transactional
+    public boolean triggerEvent(Long processInstanceId, String eventId, Map<String, Object> variables) {
+        log.info("Déclenchement de l'événement {} dans l'instance {}", eventId, processInstanceId);
+        
+        try {
+            // Récupérer l'instance de processus
+            ProcessInstance instance = processInstanceRepository.findById(processInstanceId)
+                    .orElseThrow(() -> new IllegalArgumentException("Instance de processus non trouvée: " + processInstanceId));
+            
+            // Vérifier que l'instance est active
+            if (!"ACTIVE".equals(instance.getStatus())) {
+                log.warn("Impossible de déclencher l'événement: l'instance {} n'est pas active (statut: {})",
+                        processInstanceId, instance.getStatus());
+                return false;
+            }
+            
+            // Récupérer le processus BPMN
+            BpmnProcess process = instance.getProcess();
+            
+            // Trouver l'événement dans le processus
+            Event event = process.getEvents().stream()
+                    .filter(e -> e.getId().equals(eventId))
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalArgumentException("Événement non trouvé: " + eventId));
+            
+            // Mettre à jour les variables du processus
+            if (variables != null && !variables.isEmpty()) {
+                Map<String, Object> processVariables = instance.getProcessVariables();
+                processVariables.putAll(variables);
+                instance.setProcessVariables(processVariables);
+            }
+            
+            // Trouver la séquence sortant de l'événement
+            List<SequenceFlow> outgoingFlows = process.getSequenceFlows().stream()
+                    .filter(flow -> flow.getSourceRef().equals(eventId))
+                    .collect(Collectors.toList());
+            
+            if (outgoingFlows.isEmpty()) {
+                log.warn("Aucun flux sortant trouvé pour l'événement {}", eventId);
+                return false;
+            }
+            
+            // Choisir le premier flux sortant
+            SequenceFlow nextFlow = outgoingFlows.get(0);
+            String nextElementId = nextFlow.getTargetRef();
+            
+            // Convertir les variables au format JSON
+            String inputVarsJson = null;
+            if (variables != null && !variables.isEmpty()) {
+                try {
+                    inputVarsJson = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(variables);
+                } catch (Exception e) {
+                    log.warn("Impossible de sérialiser les variables en JSON", e);
+                }
+            }
+            
+            // Enregistrer l'exécution de l'événement
+            LocalDateTime now = LocalDateTime.now();
+            ProcessExecution execution = ProcessExecution.builder()
+                    .processInstanceId(processInstanceId)
+                    .taskId(eventId)
+                    .taskName(event.getName() != null ? event.getName() : "Event: " + eventId)
+                    .status("COMPLETED")
+                    .startTime(now)
+                    .endTime(now)
+                    .durationInMillis(0L)
+                    .inputVariables(inputVarsJson)
+                    .result("EVENT_TRIGGERED")
+                    .createdAt(now)
+                    .build();
+            
+            processExecutionRepository.save(execution);
+            
+            // Mettre à jour l'instance avec la nouvelle tâche courante
+            instance.setCurrentTaskId(nextElementId);
+            instance.setUpdatedAt(LocalDateTime.now());
+            instance.getExecutionHistory().add(execution);
+            
+            // Persister les modifications
+            processInstanceRepository.save(instance);
+            
+            log.info("Événement {} déclenché avec succès dans l'instance {}, prochaine tâche: {}",
+                    eventId, processInstanceId, nextElementId);
+            
+            return true;
+        } catch (Exception e) {
+            log.error("Erreur lors du déclenchement de l'événement {} dans l'instance {}: {}",
+                    eventId, processInstanceId, e.getMessage(), e);
+            return false;
+        }
     }
 } 

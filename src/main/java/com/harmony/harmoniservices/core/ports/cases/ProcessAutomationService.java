@@ -114,4 +114,13 @@ public interface ProcessAutomationService {
      * @return Processus déployé
      */
     BpmnProcess deployProcess(String processDefinition, String name);
+    
+    /**
+     * Déclenche un événement dans une instance de processus
+     * @param processInstanceId ID de l'instance de processus
+     * @param eventId ID de l'événement BPMN
+     * @param variables Variables à transmettre à l'événement
+     * @return true si l'événement a été déclenché avec succès, false sinon
+     */
+    boolean triggerEvent(Long processInstanceId, String eventId, Map<String, Object> variables);
 } 

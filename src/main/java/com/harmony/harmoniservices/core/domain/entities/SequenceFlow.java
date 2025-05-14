@@ -19,4 +19,20 @@ public class SequenceFlow {
 
     @JsonBackReference
     private SubProcess subProcess;
+    
+    /**
+     * Retourne l'ID de l'élément source
+     * @return ID de la source
+     */
+    public String getSourceRef() {
+        return source != null ? source.getId() : null;
+    }
+    
+    /**
+     * Retourne l'ID de l'élément cible
+     * @return ID de la cible
+     */
+    public String getTargetRef() {
+        return target != null ? target.getId() : null;
+    }
 }
